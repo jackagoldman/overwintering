@@ -23,7 +23,7 @@ from scipy.spatial.distance import euclidean
 from pyproj import Transformer
 from rasterstats import zonal_stats
 import rasterio
-
+import os
 
 
 # =============================================================================
@@ -1057,6 +1057,54 @@ for dist in BUFFER_DISTANCES:
 
 
 # plot
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import contextily as ctx
+
+
+# colours
+
+C_PERIM      = '#C0392B'
+C_PERIM_EDGE = '#922B21'
+C_BUF        = '#E67E22'
+C_BUF_EDGE   = '#D35400'
+A_PERIM      = 0.45
+A_BUF        = 0.15
+PAD          = 8000   # metres padding around geometries
+
+def padded_extent(geoms, pad=PAD):
+    b = gpd.GeoSeries(geoms, crs='EPSG:3005').total_bounds
+    return b[0] - pad, b[2] + pad, b[1] - pad, b[3] + pad
+
+def draw_panel(ax, perim, buf, title):
+    buf.plot(ax=ax, color=C_BUF, edgecolor=C_BUF_EDGE,
+             linewidth=1.0, alpha=A_BUF, zorder=1)
+    perim.plot(ax=ax, color=C_PERIM, edgecolor=C_PERIM_EDGE,
+               linewidth=1.2, alpha=A_PERIM, zorder=2)
+    xmin, xmax, ymin, ymax = padded_extent(
+        list(perim.geometry) + list(buf.geometry)
+    )
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+    try:
+        ctx.add_basemap(ax, crs=perim.crs.to_string(),
+                        source=ctx.providers.CartoDB.Positron,
+                        zoom='auto', zorder=0)
+    except Exception:
+        ax.set_facecolor('#ececec')
+    ax.set_title(title, fontsize=10, fontweight='bold', pad=6)
+    ax.set_axis_off()
+
+def scale_bar(ax, length_m=5000):
+    xl, yl = ax.get_xlim(), ax.get_ylim()
+    x0 = xl[0] + (xl[1] - xl[0]) * 0.05
+    y0 = yl[0] + (yl[1] - yl[0]) * 0.05
+    ax.plot([x0, x0 + length_m], [y0, y0],
+            color='black', lw=2, zorder=5, solid_capstyle='butt')
+    ax.text(x0 + length_m / 2, y0 + (yl[1] - yl[0]) * 0.018,
+            f'{length_m // 1000} km',
+            ha='center', va='bottom', fontsize=7, zorder=5)
+
 def plot_multiyear_candidates_perim_dist(multiyear_df, fires, buffered_dfs,
                                           buffer_dist=1000, output_dir='../data/figures'):
     """
@@ -1212,5 +1260,281 @@ for dist in BUFFER_DISTANCES:
             fires=fires,
             buffered_dfs=buffered_dfs,
             buffer_dist=dist,
-            output_dir='data/figures'
+            output_dir='data/figures_to_perim/'
         )
+
+
+# =============================================================================
+# Lightnight analysis
+# =============================================================================
+
+import rasterio
+import numpy as np
+import pandas as pd
+from datetime import datetime
+
+def get_lightning_date_at_point(lat, lon, lightning_dates, lats, lons):
+    """
+    Get first lightning strike date at or nearest to a lat/lon point.
+    Returns None if no lightning recorded within the grid.
+
+    Parameters
+    ----------
+    lat, lon : float
+        Point coordinates in WGS84
+    lightning_dates : np.ndarray
+        2D array of datetime64 values (lat x lon)
+    lats, lons : np.ndarray
+        1D coordinate arrays
+    """
+    # find nearest grid cell
+    lat_idx = np.argmin(np.abs(lats - lat))
+    lon_idx = np.argmin(np.abs(lons - lon))
+
+    val = lightning_dates[lat_idx, lon_idx]
+
+    if pd.isnull(val):
+        return None
+    return pd.Timestamp(val)
+
+
+def add_lightning_filter(all_results, lightning_dates, lats, lons,
+                          max_days=7):
+    """
+    Flag overwintering candidates where the first recorded lightning strike
+    at the spring hotspot location occurred within max_days before detection.
+
+    Parameters
+    ----------
+    all_results : dict
+        Overwintering results keyed by buffer distance
+    lightning_dates : np.ndarray
+        2D array of first lightning strike dates (lat x lon)
+    lats, lons : np.ndarray
+        1D coordinate arrays from NetCDF
+    max_days : int
+        If lightning occurred within this many days before the spring
+        hotspot, flag as potential new ignition (default 7)
+    """
+    for dist, df in all_results.items():
+        df = df.copy()
+
+        lightning_flag  = []
+        lightning_date  = []
+        lightning_days  = []
+
+        for _, row in df.iterrows():
+
+            # only check overwintering candidates
+            if not row['overwintered']:
+                lightning_flag.append(None)
+                lightning_date.append(None)
+                lightning_days.append(None)
+                continue
+
+            spring_lat  = row['first_spring_lat']
+            spring_lon  = row['first_spring_lon']
+            spring_date = pd.to_datetime(row['first_spring_date'])
+
+            if pd.isna(spring_lat) or pd.isna(spring_lon):
+                lightning_flag.append(None)
+                lightning_date.append(None)
+                lightning_days.append(None)
+                continue
+
+            # get lightning date at spring hotspot location
+            lt_date = get_lightning_date_at_point(
+                spring_lat, spring_lon, lightning_dates, lats, lons
+            )
+
+            if lt_date is None:
+                # no lightning recorded at this location
+                lightning_flag.append(False)
+                lightning_date.append(None)
+                lightning_days.append(None)
+                continue
+
+            # days between lightning and spring hotspot detection
+            # positive = lightning before hotspot (potential ignition source)
+            # negative = lightning after hotspot (not a concern)
+            days_diff = (spring_date - lt_date).days
+
+            flagged = 0 <= days_diff <= max_days
+
+            lightning_flag.append(flagged)
+            lightning_date.append(lt_date)
+            lightning_days.append(days_diff)
+
+        df['flag_near_lightning']      = lightning_flag
+        df['lightning_date']           = lightning_date
+        df['lightning_days_before']    = lightning_days
+        all_results[dist] = df
+
+        # summary
+        ow = df[df['overwintered'] == True]
+        n_flagged = ow['flag_near_lightning'].sum()
+        print(f"\nBuffer {dist}m:")
+        print(f"  Overwintering candidates: {len(ow)}")
+        print(f"  Flagged near lightning:   {n_flagged}")
+        if n_flagged > 0:
+            print(ow[ow['flag_near_lightning'] == True][
+                ['fire_id', 'fire_year', 'spring_year',
+                 'first_spring_date', 'lightning_date', 'lightning_days_before']
+            ].to_string())
+
+    return all_results
+
+
+
+# inspect raw pixel values to confirm datetime format
+import xarray as xr
+
+# inspect the netcdf
+ds = xr.open_dataset('data/processed_lightning/cg_first_occurrence_2024.nc')
+print(ds)
+print(f"\nVariables: {list(ds.data_vars)}")
+print(f"Coordinates: {list(ds.coords)}")
+print(f"Dims: {dict(ds.dims)}")
+
+# check a sample variable
+var_name = list(ds.data_vars)[0]
+da = ds[var_name]
+print(f"\nVariable: {var_name}")
+print(f"Shape: {da.shape}")
+print(f"Dtype: {da.dtype}")
+print(f"Dims: {da.dims}")
+print(f"Sample values:\n{da.values.flat[:10]}")
+
+# extract the time coordinate as a 2D array (lat x lon)
+lightning_dates = ds['time'].values  # shape (39, 89), dtype datetime64[ns]
+lats = ds['lat'].values              # 1D array of latitudes
+lons = ds['lon'].values              # 1D array of longitudes
+
+print(f"Lightning date array shape: {lightning_dates.shape}")
+print(f"Lat range: {lats.min():.2f} to {lats.max():.2f}")
+print(f"Lon range: {lons.min():.2f} to {lons.max():.2f}")
+print(f"Date range: {np.nanmin(lightning_dates)} to {np.nanmax(lightning_dates)}")
+
+# check sample values
+sample = lightning_dates[~pd.isnull(lightning_dates)].flat
+print(f"Sample dates: {[str(next(sample)) for _ in range(5)]}")
+
+# check coordinate range of spring hotspot locations
+ow = all_results_perim_dist[1000]
+ow_candidates = ow[ow['overwintered'] == True]
+print(f"Spring hotspot lat range: {ow_candidates['first_spring_lat'].min():.2f} to {ow_candidates['first_spring_lat'].max():.2f}")
+print(f"Spring hotspot lon range: {ow_candidates['first_spring_lon'].min():.2f} to {ow_candidates['first_spring_lon'].max():.2f}")
+print(f"Lightning grid lat range: {lats.min():.2f} to {lats.max():.2f}")
+print(f"Lightning grid lon range: {lons.min():.2f} to {lons.max():.2f}")
+
+# run lightning filter
+
+all_results_perim_dist = add_lightning_filter(
+    all_results=all_results_perim_dist,
+    lightning_dates=lightning_dates,
+    lats=lats,
+    lons=lons,
+    max_days=7
+)
+
+
+for dist in BUFFER_DISTANCES:
+    df = all_results_perim_dist[dist].copy()
+
+    # exclude lightning-flagged fires from overwintering classification
+    lightning_mask = df['flag_near_lightning'] == True
+
+    df.loc[lightning_mask, 'overwintered']      = False
+    df.loc[lightning_mask, 'exclusion_reason']  = 'lightning_strike'
+
+    # initialise exclusion_reason for non-flagged fires
+    df['exclusion_reason'] = df['exclusion_reason'].fillna(None)
+
+    all_results_perim_dist[dist] = df
+
+    # review
+    ow = df[df['overwintered'] == True]
+    print(f"\nBuffer {dist}m — overwintering fires after lightning filter: {len(ow)}")
+    print(ow[['fire_id', 'fire_year', 'spring_year',
+               'dormancy_days', 'days_after_sdd',
+               'flag_near_lightning']].to_string())
+
+# rebuild multiyear chains after lightning exclusion
+for dist in BUFFER_DISTANCES:
+    df = all_results_perim_dist[dist]
+
+    ow_23_24 = df[
+        (df['fire_year'] == 2023) &
+        (df['overwintered'] == True) &
+        (df['spring_year'] == 2024)
+    ][['fire_id', 'fire_zone', 'linked_perim_id', 'dormancy_days',
+       'days_after_sdd', 'first_spring_dist_to_perim']].rename(columns={
+        'fire_id':                    'fire_id_2023',
+        'linked_perim_id':            'fire_id_2024',
+        'dormancy_days':              'dormancy_days_2324',
+        'days_after_sdd':             'days_after_sdd_2324',
+        'first_spring_dist_to_perim': 'dist_to_perim_2324'
+    })
+
+    ow_24_25 = df[
+        (df['fire_year'] == 2024) &
+        (df['overwintered'] == True) &
+        (df['spring_year'] == 2025)
+    ][['fire_id', 'linked_perim_id', 'dormancy_days',
+       'days_after_sdd', 'first_spring_dist_to_perim']].rename(columns={
+        'fire_id':                    'fire_id_2024',
+        'linked_perim_id':            'fire_id_2025',
+        'dormancy_days':              'dormancy_days_2425',
+        'days_after_sdd':             'days_after_sdd_2425',
+        'first_spring_dist_to_perim': 'dist_to_perim_2425'
+    })
+
+    multiyear = ow_23_24.merge(ow_24_25, on='fire_id_2024', how='inner')
+
+    print(f"\nBuffer {dist}m — multi-year chains after lightning filter: {len(multiyear)}")
+    if not multiyear.empty:
+        print(multiyear[['fire_id_2023', 'fire_id_2024', 'fire_id_2025',
+                          'dormancy_days_2324', 'dormancy_days_2425',
+                          'days_after_sdd_2324', 'days_after_sdd_2425']].to_string())
+
+for dist in [1000]:
+    df = all_results_perim_dist[dist]
+
+    ow_23_24 = df[
+        (df['fire_year'] == 2023) &
+        (df['overwintered'] == True) &
+        (df['spring_year'] == 2024)
+    ][['fire_id', 'fire_zone', 'linked_perim_id', 'dormancy_days',
+       'days_after_sdd', 'first_spring_dist_to_perim']].rename(columns={
+        'fire_id':                    'fire_id_2023',
+        'linked_perim_id':            'fire_id_2024',
+        'dormancy_days':              'dormancy_days_2324',
+        'days_after_sdd':             'days_after_sdd_2324',
+        'first_spring_dist_to_perim': 'dist_to_perim_2324'
+    })
+
+    ow_24_25 = df[
+        (df['fire_year'] == 2024) &
+        (df['overwintered'] == True) &
+        (df['spring_year'] == 2025)
+    ][['fire_id', 'linked_perim_id', 'dormancy_days',
+       'days_after_sdd', 'first_spring_dist_to_perim']].rename(columns={
+        'fire_id':                    'fire_id_2024',
+        'linked_perim_id':            'fire_id_2025',
+        'dormancy_days':              'dormancy_days_2425',
+        'days_after_sdd':             'days_after_sdd_2425',
+        'first_spring_dist_to_perim': 'dist_to_perim_2425'
+    })
+
+    multiyear_1000 = ow_23_24.merge(ow_24_25, on='fire_id_2024', how='inner')
+
+    print(f"Buffer 1000m — multi-year chains after lightning filter: {len(multiyear_1000)}")
+    print(multiyear_1000[[
+        'fire_id_2023', 'fire_id_2024', 'fire_id_2025', 'fire_zone',
+        'dormancy_days_2324', 'dormancy_days_2425',
+        'days_after_sdd_2324', 'days_after_sdd_2425',
+        'dist_to_perim_2324', 'dist_to_perim_2425'
+    ]].to_string())
+
+# save multi-year chains after lightning filter for plotting
+multiyear_1000.to_csv('data/analysis/multiyear_chains_perimdist_1000m_lightningfiltered.csv', index=False)
